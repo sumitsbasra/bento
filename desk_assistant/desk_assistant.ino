@@ -3,7 +3,7 @@
 // Swipe between 5 screens: Assistant (center), Calendar (left), Clock (right), YouTube (top), Weather (bottom)
 // Tap the assistant screen to talk to it
 
-#include <TFT_eSPI.h>
+#include <Waveshare_AMOLED.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -13,12 +13,13 @@
 #include <time.h>
 
 // === DISPLAY & TOUCH ===
-TFT_eSPI tft = TFT_eSPI();
+Waveshare_AMOLED amoled;
+#define tft amoled  // Alias so the rest of the code works
 TouchLib touch; // Adjust based on your touchscreen controller (e.g., CST816S, FT6236)
 
 // === WIFI CONFIG ===
-const char* WIFI_SSID = "your-wifi-ssid";
-const char* WIFI_PASSWORD = "your-wifi-password";
+const char* WIFI_SSID = "ggggg uwu";
+const char* WIFI_PASSWORD = "tE9Denbb-iitbiuts";
 
 // === API KEYS ===
 const char* YOUTUBE_API_KEY = "your-youtube-api-key";
