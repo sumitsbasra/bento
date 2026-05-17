@@ -1,6 +1,6 @@
-# ESP32 Desk Assistant
+# Bento
 
-A desk-top voice assistant on a 466x466 touchscreen ESP32 that connects to OpenClaw - swipe between 5 screens showing your assistant, calendar, clock, weather, and YouTube subscriber count. Tap the assistant screen to talk to it, and it responds with voice while showing transcriptions and responses on the display.
+A desk-top voice assistant on a 466x466 touchscreen ESP32 that connects to OpenClaw - swipe between 5 screens showing your assistant, calendar, clock, YouTube subscriber count, and HomeKit light controls. Tap the assistant screen to talk to it, and it responds with voice while showing transcriptions and responses on the display.
 
 ## Features
 
@@ -8,11 +8,11 @@ A desk-top voice assistant on a 466x466 touchscreen ESP32 that connects to OpenC
 
 **Screen Layout:**
 ```
-        YouTube (top)
-           ↕
+          YouTube (top)
+               ↕
 Calendar ← Assistant → Clock
-           ↕
-        Weather (bottom)
+               ↕
+        HomeKit Lights (bottom)
 ```
 
 1. **Assistant (Center)** - Main voice interaction screen
@@ -21,26 +21,26 @@ Calendar ← Assistant → Clock
    - Displays AI response while speaking
    - Visual states: Idle, Listening, Thinking, Speaking
 
-2. **YouTube (Top)** - Subscriber stats
-   - Large subscriber count display
-   - Daily gain indicator (faint grey at bottom)
-   - Auto-updates every 5 minutes
-
-3. **Calendar (Left)** - Today's events
+2. **Calendar (Left)** - Today's events
    - Shows upcoming events
    - Time until next event
    - Clean card-based layout
 
-4. **Clock (Right)** - Time and date
+3. **Clock (Right)** - Time and date
    - Large time display
    - Current date
    - Updates every second
 
-5. **Weather (Bottom)** - Current weather
-   - Temperature
-   - Condition (Sunny, Cloudy, Rainy)
-   - Location
-   - Simple weather icons
+4. **YouTube (Top)** - Subscriber stats
+   - Large subscriber count display
+   - Daily gain indicator (faint grey at bottom)
+   - Auto-updates every 5 minutes
+
+5. **HomeKit Lights (Bottom)** - HomeKit light controls
+   - 2×2 card grid for 4 light zones (Desk, Lamp, Strip, Monitor)
+   - Tap a card to toggle on/off
+   - Shows brightness percentage when on
+   - Syncs bidirectionally with HomeKit (Siri, Home app, automations)
 
 ## Hardware Requirements
 
@@ -61,12 +61,14 @@ Calendar ← Assistant → Clock
 #include <ArduinoJson.h>
 #include <TouchLib.h>
 #include <time.h>
+#include "HomeSpan.h"
 ```
 
 Install via Arduino Library Manager:
 - TFT_eSPI
 - WebSockets by Markus Sattler
 - ArduinoJson by Benoit Blanchon
+- HomeSpan by Tony Pagliaro
 - HTTPClient (included with ESP32 core)
 
 ## Setup
@@ -88,19 +90,42 @@ const char* WIFI_PASSWORD = "your-wifi-password";
 4. Create credentials → API Key
 5. Find your Channel ID: Go to YouTube Studio → Settings → Channel → Advanced settings
 
-**OpenWeatherMap API:**
-1. Sign up at [OpenWeatherMap](https://openweathermap.org/api)
-2. Get free API key from your account dashboard
-
 Update in code:
 ```cpp
 const char* YOUTUBE_API_KEY = "your-youtube-api-key";
 const char* YOUTUBE_CHANNEL_ID = "your-channel-id";
-const char* OPENWEATHER_API_KEY = "your-openweather-api-key";
-const char* WEATHER_LOCATION = "San Francisco,US"; // City,Country code
 ```
 
-### 3. Configure WebSocket Server (for Assistant & Calendar only)
+### 3. Configure HomeKit Lights
+
+The ESP32 acts as a HomeKit bridge exposing 4 virtual lightbulbs (Desk, Lamp, LED Strip, Monitor Light). Customize the names and default brightness in code:
+
+```cpp
+LightState lights[4] = {
+  {"Desk",    false, 80},
+  {"Lamp",    false, 60},
+  {"Strip",   false, 100},
+  {"Monitor", false, 70}
+};
+```
+
+Change the pairing code before first use (format must be `XXX-XX-XXX`, digits only, avoid Apple-reserved codes):
+
+```cpp
+homeSpan.setPairingCode("031-45-154");
+```
+
+**To pair with HomeKit:**
+1. Open the Home app on iPhone/iPad
+2. Tap **+** → **Add Accessory** → **More Options**
+3. Select "Bento" from the list
+4. Enter the pairing code when prompted
+5. The bridge appears with 4 lightbulb accessories
+6. Link each virtual bulb to your real lights via HomeKit automations, or control them directly
+
+**Bidirectional sync:** tapping a card on the screen notifies HomeKit, and changes made via Siri/Home app/automations update the screen in real time.
+
+### 5. Configure WebSocket Server (for Assistant & Calendar only)
 
 Point to your openclaw-voice server:
 ```cpp
@@ -108,14 +133,14 @@ const char* WS_HOST = "192.168.1.100"; // Your openclaw-voice server IP
 const int WS_PORT = 8765;
 ```
 
-### 4. Configure Timezone
+### 6. Configure Timezone
 
 Update for your timezone:
 ```cpp
 configTime(-8 * 3600, 0, "pool.ntp.org"); // PST example
 ```
 
-### 5. Setup OpenClaw-Voice Backend (for Assistant & Calendar)
+### 7. Setup OpenClaw-Voice Backend (for Assistant & Calendar)
 
 The ESP32 connects to OpenClaw for voice assistant functionality and calendar events only. YouTube and Weather data are fetched directly via APIs.
 
@@ -140,9 +165,9 @@ From Server → ESP32:
 
 **Note:** YouTube stats and Weather data are fetched directly from Google/OpenWeatherMap APIs, not through OpenClaw.
 
-### 6. Upload to ESP32
+### 8. Upload to ESP32
 
-1. Open `esp32_desk_assistant.ino` in Arduino IDE
+1. Open `bento.ino` in Arduino IDE
 2. Select your ESP32 board
 3. Configure TFT_eSPI for your display (edit `User_Setup.h`)
 4. Upload!
@@ -150,14 +175,15 @@ From Server → ESP32:
 ## Touch Gestures
 
 - **Tap** (on assistant screen) - Start/stop voice listening
+- **Tap** (on lights screen) - Toggle that light on/off
 - **Swipe left/right** - Navigate between Calendar ↔ Assistant ↔ Clock
-- **Swipe up/down** - Navigate between YouTube ↔ Assistant ↔ Weather
+- **Swipe up/down** - Navigate between YouTube ↔ Assistant ↔ Lights
 
 ## Navigation Rules
 
-- Horizontal swipes only work from Calendar/Assistant/Clock
-- Vertical swipes only work from YouTube/Assistant/Weather
-- Assistant screen is the hub - connects to all other screens
+- Horizontal swipes work from Calendar/Assistant/Clock
+- Vertical swipes work from YouTube/Assistant/Lights
+- Assistant screen is the hub — connects to all other screens
 
 ## TODO / Future Enhancements
 
@@ -176,17 +202,17 @@ From Server → ESP32:
 ```
 ┌─────────────────────────────────────────┐
 │              ESP32 Display              │
-└──┬──────────────┬───────────────┬───────┘
-   │              │               │
-   │ WiFi/WS      │ HTTPS         │ HTTPS
-   │              │               │
-   ↓              ↓               ↓
-┌──────────┐  ┌─────────┐  ┌──────────┐
-│OpenClaw- │  │ YouTube │  │OpenWeather│
-│  Voice   │  │Data API │  │   API    │
-│ WebSocket│  │         │  │          │
-└────┬─────┘  └─────────┘  └──────────┘
-     │
+└──┬──────────────┬───────────────────────┘
+   │              │                    │
+   │ WiFi/WS      │ HTTPS              │ HAP (TCP)
+   │              │                    │
+   ↓              ↓                    ↓
+┌──────────┐  ┌─────────┐        ┌──────────┐
+│OpenClaw- │  │ YouTube │        │ HomeKit  │
+│  Voice   │  │Data API │        │ (Home    │
+│ WebSocket│  │         │        │  app /   │
+└────┬─────┘  └─────────┘        │  Siri)   │
+     │                            └──────────┘
      ↓
 ┌──────────┐
 │ OpenClaw │
@@ -203,7 +229,7 @@ From Server → ESP32:
 **Data Flow:**
 - **Assistant & Calendar** → OpenClaw WebSocket → LLM + Calendar API
 - **YouTube Stats** → Direct HTTPS to YouTube Data API v3
-- **Weather** → Direct HTTPS to OpenWeatherMap API
+- **HomeKit Lights** → HomeKit Accessory Protocol (HAP) over local TCP; ESP32 acts as a bridge with 4 virtual lightbulb accessories; changes sync bidirectionally with the Home app, Siri, and automations
 
 ## License
 

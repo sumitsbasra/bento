@@ -1,6 +1,6 @@
-// ESP32 Desk Assistant
+// Bento
 // A desk-top voice assistant on a 466x466 touchscreen ESP32 that connects to OpenClaw
-// Swipe between 5 screens: Assistant (center), Calendar (left), Clock (right), YouTube (top), Weather (bottom)
+// Swipe between 5 screens: YouTube (top), Calendar (left), Assistant (center), Clock (right), HomeKit Lights (bottom)
 // Tap the assistant screen to talk to it
 
 #include <Waveshare_AMOLED.h>
@@ -11,6 +11,7 @@
 #include <ArduinoJson.h>
 #include <TouchLib.h>
 #include <time.h>
+#include "HomeSpan.h"
 
 // === DISPLAY & TOUCH ===
 Waveshare_AMOLED amoled;
@@ -24,8 +25,6 @@ const char* WIFI_PASSWORD = "tE9Denbb-iitbiuts";
 // === API KEYS ===
 const char* YOUTUBE_API_KEY = "your-youtube-api-key";
 const char* YOUTUBE_CHANNEL_ID = "your-channel-id";
-const char* OPENWEATHER_API_KEY = "your-openweather-api-key";
-const char* WEATHER_LOCATION = "San Francisco,US"; // City,Country code
 
 // === OPENCLAW-VOICE WEBSOCKET (for assistant only) ===
 const char* WS_HOST = "192.168.1.100"; // Your openclaw-voice server IP
@@ -37,11 +36,11 @@ WiFiClientSecure httpsClient;
 
 // === SCREEN STATES ===
 enum Screen {
-  SCREEN_YOUTUBE,   // Top (swipe down from assistant)
+  SCREEN_YOUTUBE,   // Top
   SCREEN_CALENDAR,  // Left
   SCREEN_ASSISTANT, // Center (default)
   SCREEN_CLOCK,     // Right
-  SCREEN_WEATHER    // Bottom (swipe up from assistant)
+  SCREEN_LIGHTS,    // Bottom
 };
 
 Screen currentScreen = SCREEN_ASSISTANT;
@@ -80,12 +79,45 @@ struct CalendarEvent {
 };
 std::vector<CalendarEvent> todaysEvents;
 
-struct WeatherData {
-  int temperature;
-  String condition;
-  String location;
+// === LIGHTS STATE ===
+struct LightState {
+  const char* name;
+  bool on;
+  int brightness; // 0-100
 };
-WeatherData currentWeather = {72, "Sunny", "San Francisco"};
+
+LightState lights[4] = {
+  {"Desk",    false, 80},
+  {"Lamp",    false, 60},
+  {"Strip",   false, 100},
+  {"Monitor", false, 70}
+};
+
+// HAP characteristic pointers (set during HomeSpan setup)
+SpanCharacteristic* hapPower[4];
+SpanCharacteristic* hapBright[4];
+
+void drawLightsScreen(); // forward declaration needed by DEV_Lightbulb::update()
+
+struct DEV_Lightbulb : Service::LightBulb {
+  SpanCharacteristic* power;
+  SpanCharacteristic* bright;
+  int idx;
+
+  DEV_Lightbulb(int lightIndex) : Service::LightBulb() {
+    idx   = lightIndex;
+    power = new Characteristic::On(lights[idx].on);
+    bright = new Characteristic::Brightness(lights[idx].brightness);
+    bright->setRange(0, 100, 1);
+  }
+
+  boolean update() override {
+    if (power->updated())  lights[idx].on         = power->getNewVal<bool>();
+    if (bright->updated()) lights[idx].brightness = bright->getNewVal<int>();
+    if (currentScreen == SCREEN_LIGHTS) drawLightsScreen();
+    return true;
+  }
+};
 
 // === SETUP ===
 void setup() {
@@ -112,15 +144,41 @@ void setup() {
   
   // Request initial data
   requestYouTubeStats();
-  requestWeatherData();
   requestCalendarEvents();
-  
+
+  // HomeKit via HomeSpan (WiFi already connected above)
+  homeSpan.setWifiCredentials(WIFI_SSID, WIFI_PASSWORD);
+  homeSpan.setPairingCode("031-45-154"); // change before pairing
+  homeSpan.setSketchVersion("1.0");
+  homeSpan.begin(Category::Bridges, "Bento");
+
+  new SpanAccessory();
+    new Service::AccessoryInformation();
+      new Characteristic::Name("Bento");
+      new Characteristic::Manufacturer("DIY");
+      new Characteristic::SerialNumber("DA-001");
+      new Characteristic::Model("ESP32");
+      new Characteristic::FirmwareRevision("1.0");
+      new Characteristic::Identify();
+
+  const char* accNames[] = {"Desk Light", "Lamp", "LED Strip", "Monitor Light"};
+  for (int i = 0; i < 4; i++) {
+    new SpanAccessory();
+      new Service::AccessoryInformation();
+        new Characteristic::Name(accNames[i]);
+        new Characteristic::Identify();
+      DEV_Lightbulb* lb = new DEV_Lightbulb(i);
+      hapPower[i]  = lb->power;
+      hapBright[i] = lb->bright;
+  }
+
   // Initial screen
   drawCurrentScreen();
 }
 
 // === MAIN LOOP ===
 void loop() {
+  homeSpan.poll();
   webSocket.loop();
   handleTouch();
   updateCurrentScreen();
@@ -210,86 +268,76 @@ void handleGesture() {
 }
 
 void swipeHorizontal(int direction) {
-  // Only works on horizontal screens (Calendar, Assistant, Clock)
-  if (currentScreen == SCREEN_YOUTUBE || currentScreen == SCREEN_WEATHER) {
-    return; // Can't swipe horizontally from vertical screens
+  // Horizontal row: Calendar ← Assistant → Clock
+  if (currentScreen == SCREEN_YOUTUBE || currentScreen == SCREEN_LIGHTS) {
+    return;
   }
-  
+
   if (direction > 0) {
-    // Swipe left = go right
-    if (currentScreen == SCREEN_CALENDAR) {
-      currentScreen = SCREEN_ASSISTANT;
-    } else if (currentScreen == SCREEN_ASSISTANT) {
-      currentScreen = SCREEN_CLOCK;
-    }
+    if (currentScreen == SCREEN_CALENDAR)  currentScreen = SCREEN_ASSISTANT;
+    else if (currentScreen == SCREEN_ASSISTANT) currentScreen = SCREEN_CLOCK;
   } else {
-    // Swipe right = go left
-    if (currentScreen == SCREEN_CLOCK) {
-      currentScreen = SCREEN_ASSISTANT;
-    } else if (currentScreen == SCREEN_ASSISTANT) {
-      currentScreen = SCREEN_CALENDAR;
-    }
+    if (currentScreen == SCREEN_CLOCK)     currentScreen = SCREEN_ASSISTANT;
+    else if (currentScreen == SCREEN_ASSISTANT) currentScreen = SCREEN_CALENDAR;
   }
-  
+
   drawCurrentScreen();
 }
 
 void swipeVertical(int direction) {
-  // Only works on vertical screens (YouTube, Assistant, Weather)
+  // Vertical column: YouTube ↕ Assistant ↕ Lights
   if (currentScreen == SCREEN_CALENDAR || currentScreen == SCREEN_CLOCK) {
-    return; // Can't swipe vertically from horizontal screens
+    return;
   }
-  
+
   if (direction > 0) {
-    // Swipe up = go down
-    if (currentScreen == SCREEN_YOUTUBE) {
-      currentScreen = SCREEN_ASSISTANT;
-    } else if (currentScreen == SCREEN_ASSISTANT) {
-      currentScreen = SCREEN_WEATHER;
-    }
+    if (currentScreen == SCREEN_YOUTUBE)   currentScreen = SCREEN_ASSISTANT;
+    else if (currentScreen == SCREEN_ASSISTANT) currentScreen = SCREEN_LIGHTS;
   } else {
-    // Swipe down = go up
-    if (currentScreen == SCREEN_WEATHER) {
-      currentScreen = SCREEN_ASSISTANT;
-    } else if (currentScreen == SCREEN_ASSISTANT) {
-      currentScreen = SCREEN_YOUTUBE;
-    }
+    if (currentScreen == SCREEN_LIGHTS)    currentScreen = SCREEN_ASSISTANT;
+    else if (currentScreen == SCREEN_ASSISTANT) currentScreen = SCREEN_YOUTUBE;
   }
-  
+
   drawCurrentScreen();
 }
 
 void handleTap(int x, int y) {
   if (currentScreen == SCREEN_ASSISTANT) {
     if (assistantState == IDLE) {
-      // Start listening
       startListening();
     } else if (assistantState == LISTENING) {
-      // Cancel listening
       stopListening();
     }
+  } else if (currentScreen == SCREEN_LIGHTS) {
+    // 2x2 card grid — determine which card was tapped
+    const int MARGIN  = 20;
+    const int GAP     = 14;
+    const int TOP_OFF = 50;
+    const int CARD_W  = (466 - MARGIN * 2 - GAP) / 2;       // 206
+    const int CARD_H  = (466 - TOP_OFF - MARGIN - GAP) / 2; // 191
+
+    for (int i = 0; i < 4; i++) {
+      int col = i % 2;
+      int row = i / 2;
+      int cx  = MARGIN + col * (CARD_W + GAP);
+      int cy  = TOP_OFF + row * (CARD_H + GAP);
+
+      if (x >= cx && x < cx + CARD_W && y >= cy && y < cy + CARD_H) {
+        toggleLight(i);
+        break;
+      }
+    }
   }
-  // Other screens don't respond to tap (only swipe)
 }
 
 // === SCREEN DRAWING ===
 void drawCurrentScreen() {
   switch (currentScreen) {
-    case SCREEN_YOUTUBE:
-      drawYouTubeScreen();
-      break;
-    case SCREEN_CALENDAR:
-      drawCalendarScreen();
-      break;
-    case SCREEN_ASSISTANT:
-      drawAssistantScreen();
-      break;
-    case SCREEN_CLOCK:
-      drawClockScreen();
-      break;
-    case SCREEN_WEATHER:
-      drawWeatherScreen();
-      break;
+    case SCREEN_YOUTUBE:    drawYouTubeScreen();   break;
+    case SCREEN_CALENDAR:   drawCalendarScreen();  break;
+    case SCREEN_ASSISTANT:  drawAssistantScreen(); break;
+    case SCREEN_CLOCK:      drawClockScreen();     break;
+    case SCREEN_LIGHTS:     drawLightsScreen();    break;
   }
 }
 
@@ -309,7 +357,6 @@ void updateCurrentScreen() {
   // Refresh data every 5 minutes
   if (now - lastDataRefresh > 300000) {
     requestYouTubeStats();
-    requestWeatherData();
     requestCalendarEvents();
     lastDataRefresh = now;
   }
@@ -616,111 +663,32 @@ void drawEventCard(const CalendarEvent& event, int x, int y) {
   }
 }
 
-// === WEATHER SCREEN ===
-void drawWeatherScreen() {
-  tft.fillScreen(TFT_BLACK);
-  drawScreenIndicator();
-  
-  // Location
-  tft.setTextColor(TFT_LIGHTGREY);
-  tft.setTextSize(2);
-  int locWidth = currentWeather.location.length() * 12;
-  tft.setCursor((466 - locWidth) / 2, 80);
-  tft.print(currentWeather.location);
-  
-  // Temperature - BIG
-  tft.setTextColor(TFT_CYAN);
-  tft.setTextSize(10);
-  String temp = String(currentWeather.temperature) + "°";
-  int tempWidth = temp.length() * 60;
-  tft.setCursor((466 - tempWidth) / 2, 160);
-  tft.print(temp);
-  
-  // Condition
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(3);
-  int condWidth = currentWeather.condition.length() * 18;
-  tft.setCursor((466 - condWidth) / 2, 280);
-  tft.print(currentWeather.condition);
-  
-  // Weather icon based on condition
-  drawWeatherIcon(233, 370, currentWeather.condition);
-}
-
-void drawWeatherIcon(int cx, int cy, String condition) {
-  // Simple weather icons
-  if (condition == "Sunny" || condition == "Clear") {
-    // Sun
-    tft.fillCircle(cx, cy, 30, TFT_YELLOW);
-    for (int i = 0; i < 8; i++) {
-      float angle = i * 45 * PI / 180.0;
-      int x1 = cx + cos(angle) * 40;
-      int y1 = cy + sin(angle) * 40;
-      int x2 = cx + cos(angle) * 55;
-      int y2 = cy + sin(angle) * 55;
-      tft.drawLine(x1, y1, x2, y2, TFT_YELLOW);
-    }
-  } else if (condition == "Cloudy" || condition == "Partly Cloudy") {
-    // Cloud
-    tft.fillCircle(cx - 20, cy, 20, TFT_LIGHTGREY);
-    tft.fillCircle(cx, cy - 10, 25, TFT_LIGHTGREY);
-    tft.fillCircle(cx + 20, cy, 20, TFT_LIGHTGREY);
-    tft.fillRect(cx - 40, cy, 60, 20, TFT_LIGHTGREY);
-  } else if (condition == "Rainy" || condition == "Rain") {
-    // Cloud with rain
-    tft.fillCircle(cx - 20, cy - 20, 20, TFT_LIGHTGREY);
-    tft.fillCircle(cx, cy - 30, 25, TFT_LIGHTGREY);
-    tft.fillCircle(cx + 20, cy - 20, 20, TFT_LIGHTGREY);
-    tft.fillRect(cx - 40, cy - 20, 60, 20, TFT_LIGHTGREY);
-    // Rain drops
-    for (int i = 0; i < 5; i++) {
-      int x = cx - 30 + i * 15;
-      tft.drawLine(x, cy + 5, x, cy + 20, TFT_BLUE);
-    }
-  }
-}
-
 // === SCREEN INDICATOR ===
 void drawScreenIndicator() {
-  // Draw a cross pattern showing position
+  // Cross pattern: 3 horizontal dots (Calendar/Assistant/Clock)
+  //               + YouTube above + Lights below (both on the Assistant axis)
   int cx = 233;
-  int cy = 20;
-  int spacing = 25;
-  
-  // Horizontal dots (Calendar - Assistant - Clock)
+  int cy = 30;
+  int hSpacing = 25;
+  int vSpacing = 22;
+
+  // Horizontal row: Calendar(0), Assistant(1), Clock(2)
+  Screen hScreens[3] = {SCREEN_CALENDAR, SCREEN_ASSISTANT, SCREEN_CLOCK};
   for (int i = 0; i < 3; i++) {
-    int x = cx - spacing + i * spacing;
-    bool active = false;
-    
-    if (i == 0 && currentScreen == SCREEN_CALENDAR) active = true;
-    if (i == 1 && currentScreen == SCREEN_ASSISTANT) active = true;
-    if (i == 2 && currentScreen == SCREEN_CLOCK) active = true;
-    
-    if (active) {
-      tft.fillCircle(x, cy, 5, TFT_WHITE);
-    } else {
-      tft.drawCircle(x, cy, 5, TFT_DARKGREY);
-    }
+    int x = cx - hSpacing + i * hSpacing;
+    bool active = (currentScreen == hScreens[i]);
+    if (active) tft.fillCircle(x, cy, 5, TFT_WHITE);
+    else        tft.drawCircle(x, cy, 5, TFT_DARKGREY);
   }
-  
-  // Vertical dots (YouTube - Assistant - Weather)
-  for (int i = 0; i < 3; i++) {
-    int y = cy - spacing + i * spacing;
-    bool active = false;
-    
-    if (i == 0 && currentScreen == SCREEN_YOUTUBE) active = true;
-    if (i == 1 && currentScreen == SCREEN_ASSISTANT) active = true;
-    if (i == 2 && currentScreen == SCREEN_WEATHER) active = true;
-    
-    // Skip the center dot (already drawn in horizontal)
-    if (i == 1) continue;
-    
-    if (active) {
-      tft.fillCircle(cx, y, 5, TFT_WHITE);
-    } else {
-      tft.drawCircle(cx, y, 5, TFT_DARKGREY);
-    }
-  }
+
+  // Vertical axis on Assistant (cx = 233)
+  bool activeY = (currentScreen == SCREEN_YOUTUBE);
+  if (activeY) tft.fillCircle(cx, cy - vSpacing, 5, TFT_WHITE);
+  else         tft.drawCircle(cx, cy - vSpacing, 5, TFT_DARKGREY);
+
+  bool activeL = (currentScreen == SCREEN_LIGHTS);
+  if (activeL) tft.fillCircle(cx, cy + vSpacing, 5, TFT_WHITE);
+  else         tft.drawCircle(cx, cy + vSpacing, 5, TFT_DARKGREY);
 }
 
 // === ICON DRAWING ===
@@ -741,6 +709,77 @@ void drawSpeakerIcon(int cx, int cy, uint16_t color) {
     int offset = i * 8;
     tft.drawArc(cx + 5, cy, 15 + offset, 10 + offset, 300, 60, color, TFT_BLACK);
   }
+}
+
+// === LIGHTS SCREEN ===
+void drawLightsScreen() {
+  tft.fillScreen(TFT_BLACK);
+  drawScreenIndicator();
+
+  // Title
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(170, 38);
+  tft.print("Lights");
+
+  const int MARGIN  = 20;
+  const int GAP     = 14;
+  const int TOP_OFF = 58;
+  const int CARD_W  = (466 - MARGIN * 2 - GAP) / 2;       // 206
+  const int CARD_H  = (466 - TOP_OFF - MARGIN - GAP) / 2; // 187
+
+  for (int i = 0; i < 4; i++) {
+    int col = i % 2;
+    int row = i / 2;
+    int x   = MARGIN + col * (CARD_W + GAP);
+    int y   = TOP_OFF + row * (CARD_H + GAP);
+
+    // Card background: warm amber when on, dark grey when off
+    uint16_t cardBg = lights[i].on ? tft.color565(60, 50, 5) : tft.color565(30, 30, 30);
+    tft.fillRoundRect(x, y, CARD_W, CARD_H, 16, cardBg);
+
+    // Bulb icon
+    int bulbCX = x + CARD_W / 2;
+    int bulbCY = y + CARD_H / 2 - 20;
+    uint16_t iconColor = lights[i].on ? TFT_YELLOW : tft.color565(70, 70, 70);
+    tft.fillCircle(bulbCX, bulbCY, 30, iconColor);
+    tft.fillRect(bulbCX - 8, bulbCY + 30, 16, 10, iconColor);
+    tft.fillRect(bulbCX - 6, bulbCY + 40, 12, 6, iconColor);
+
+    // Light name
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(2);
+    int nameLen = strlen(lights[i].name);
+    tft.setCursor(x + (CARD_W - nameLen * 12) / 2, y + CARD_H - 50);
+    tft.print(lights[i].name);
+
+    // On/Off label + brightness
+    if (lights[i].on) {
+      tft.setTextColor(TFT_YELLOW);
+      tft.setTextSize(2);
+      tft.setCursor(x + (CARD_W - 24) / 2, y + CARD_H - 32);
+      tft.print("ON");
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_LIGHTGREY);
+      String bStr = String(lights[i].brightness) + "%";
+      tft.setCursor(x + (CARD_W - (int)bStr.length() * 6) / 2, y + CARD_H - 16);
+      tft.print(bStr);
+    } else {
+      tft.setTextColor(tft.color565(100, 100, 100));
+      tft.setTextSize(2);
+      tft.setCursor(x + (CARD_W - 36) / 2, y + CARD_H - 32);
+      tft.print("OFF");
+    }
+  }
+}
+
+void toggleLight(int idx) {
+  if (idx < 0 || idx >= 4) return;
+  lights[idx].on = !lights[idx].on;
+  // Notify HomeKit of the new state
+  hapPower[idx]->setVal(lights[idx].on ? 1 : 0);
+  hapBright[idx]->setVal(lights[idx].brightness);
+  drawLightsScreen();
 }
 
 // === TEXT UTILITIES ===
@@ -828,47 +867,6 @@ void requestYouTubeStats() {
   http.end();
 }
 
-void requestWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  
-  HTTPClient http;
-  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + 
-               String(WEATHER_LOCATION) + "&appid=" + String(OPENWEATHER_API_KEY) + 
-               "&units=imperial";
-  
-  http.begin(url);
-  int httpCode = http.GET();
-  
-  if (httpCode == 200) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (!error) {
-      currentWeather.temperature = doc["main"]["temp"].as<int>();
-      currentWeather.location = doc["name"].as<String>();
-      
-      // Map weather condition
-      String weatherMain = doc["weather"][0]["main"].as<String>();
-      if (weatherMain == "Clear") {
-        currentWeather.condition = "Sunny";
-      } else if (weatherMain == "Clouds") {
-        currentWeather.condition = "Cloudy";
-      } else if (weatherMain == "Rain" || weatherMain == "Drizzle") {
-        currentWeather.condition = "Rainy";
-      } else {
-        currentWeather.condition = weatherMain;
-      }
-      
-      if (currentScreen == SCREEN_WEATHER) {
-        drawWeatherScreen();
-      }
-    }
-  }
-  
-  http.end();
-}
-
 void requestCalendarEvents() {
   // This still goes through OpenClaw since calendar requires OAuth
   StaticJsonDocument<200> doc;
@@ -887,7 +885,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       
     case WStype_CONNECTED:
       Serial.println("WebSocket Connected");
-      // Request calendar data on connect (YouTube and Weather use direct API calls)
+      // Request calendar data on connect
       requestCalendarEvents();
       break;
       
