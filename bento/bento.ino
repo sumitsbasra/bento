@@ -12,6 +12,16 @@
 #include <TouchLib.h>
 #include <time.h>
 #include "HomeSpan.h"
+#include <AnimatedGIF.h>
+
+// === GIF ASSETS ===
+// Each GIF should be ~240x240px, exported as a looping animation.
+// Convert to C arrays with: xxd -i ambient.gif > gif_ambient.h  (repeat for each)
+// Then place the .h files alongside bento.ino.
+#include "gif_ambient.h"    // const uint8_t gif_ambient[]   PROGMEM; extern const uint32_t gif_ambient_len;
+#include "gif_listening.h"  // const uint8_t gif_listening[] PROGMEM; extern const uint32_t gif_listening_len;
+#include "gif_thinking.h"   // const uint8_t gif_thinking[]  PROGMEM; extern const uint32_t gif_thinking_len;
+#include "gif_speaking.h"   // const uint8_t gif_speaking[]  PROGMEM; extern const uint32_t gif_speaking_len;
 
 // === DISPLAY & TOUCH ===
 Waveshare_AMOLED amoled;
@@ -96,6 +106,85 @@ LightState lights[4] = {
 // HAP characteristic pointers (set during HomeSpan setup)
 SpanCharacteristic* hapPower[4];
 SpanCharacteristic* hapBright[4];
+
+// === GIF PLAYER ===
+AnimatedGIF gif;
+AssistantState activeGifState = (AssistantState)-1; // tracks which GIF is open
+
+// GIF canvas offset — centres the animation on the 466×466 display.
+// Populated after gif.open() using gif.getCanvasSize().
+static int gifOffsetX = 0;
+static int gifOffsetY = 80; // leave ~80px at top for screen indicator + breathing room
+
+// Per-scanline draw callback used by AnimatedGIF
+void gifDrawCallback(GIFDRAW* pDraw) {
+  // Build a temporary RGB565 line, respecting transparency
+  uint16_t lineBuffer[pDraw->iWidth];
+  uint8_t* src = pDraw->pPixels;
+  uint16_t* palette = pDraw->pPalette;
+
+  for (int i = 0; i < pDraw->iWidth; i++) {
+    uint8_t idx = src[i];
+    // Skip transparent pixels (keep whatever is already on screen)
+    if (pDraw->ucHasTransparency && idx == pDraw->ucTransparent) {
+      // Read back the current pixel so we don't corrupt the text area.
+      // For simplicity we just write black — the GIF bg is already black.
+      lineBuffer[i] = TFT_BLACK;
+    } else {
+      lineBuffer[i] = palette[idx];
+    }
+  }
+
+  int screenX = gifOffsetX + pDraw->iX;
+  int screenY = gifOffsetY + pDraw->iY + pDraw->y;
+  tft.pushImage(screenX, screenY, pDraw->iWidth, 1, lineBuffer);
+}
+
+// Open the correct GIF for the given state. Clears screen and resets offset.
+void openGifForState(AssistantState state) {
+  gif.close();
+
+  const uint8_t* data = nullptr;
+  uint32_t len = 0;
+
+  switch (state) {
+    case IDLE:      data = gif_ambient;   len = gif_ambient_len;   break;
+    case LISTENING: data = gif_listening; len = gif_listening_len; break;
+    case THINKING:  data = gif_thinking;  len = gif_thinking_len;  break;
+    case SPEAKING:  data = gif_speaking;  len = gif_speaking_len;  break;
+  }
+
+  if (!data || !gif.open((uint8_t*)data, len, gifDrawCallback)) {
+    Serial.printf("GIF open failed for state %d\n", state);
+    return;
+  }
+
+  // Centre the GIF horizontally; leave top 80px for indicator
+  int w, h;
+  gif.getCanvasSize(&w, &h);
+  gifOffsetX = (466 - w) / 2;
+  // gifOffsetY stays at 80 unless the GIF is taller than the usable area
+  gifOffsetY = 80;
+  if (gifOffsetY + h > 350) gifOffsetY = max(0, 350 - h); // keep bottom 116px for text
+
+  activeGifState = state;
+}
+
+// Call every loop iteration while on the assistant screen.
+// Returns true if a new frame was rendered.
+bool tickAssistantGif() {
+  if (activeGifState == (AssistantState)-1) return false;
+
+  int nextFrameMs;
+  int result = gif.playFrame(false, &nextFrameMs);
+
+  if (result == 0) {
+    // End of GIF — loop it
+    gif.reset();
+  }
+
+  return (result >= 0);
+}
 
 void drawLightsScreen(); // forward declaration needed by DEV_Lightbulb::update()
 
@@ -345,27 +434,44 @@ void updateCurrentScreen() {
   static unsigned long lastUpdate = 0;
   static unsigned long lastDataRefresh = 0;
   unsigned long now = millis();
-  
-  // Update screen every second for clock
+
+  // Clock refreshes every second
   if (now - lastUpdate > 1000) {
-    if (currentScreen == SCREEN_CLOCK) {
-      drawClockScreen();
-    }
+    if (currentScreen == SCREEN_CLOCK) drawClockScreen();
     lastUpdate = now;
   }
-  
-  // Refresh data every 5 minutes
+
+  // Data refresh every 5 minutes
   if (now - lastDataRefresh > 300000) {
     requestYouTubeStats();
     requestCalendarEvents();
     lastDataRefresh = now;
   }
-  
-  // Update assistant screen if state changed
-  static AssistantState lastState = IDLE;
-  if (currentScreen == SCREEN_ASSISTANT && assistantState != lastState) {
-    drawAssistantScreen();
-    lastState = assistantState;
+
+  if (currentScreen == SCREEN_ASSISTANT) {
+    static AssistantState lastState = (AssistantState)-1;
+
+    // State changed → swap GIF and redraw text overlay
+    if (assistantState != lastState) {
+      openGifForState(assistantState);
+      tft.fillScreen(TFT_BLACK);
+      gif.playFrame(false, nullptr); // first frame
+      drawAssistantTextOverlay();
+      lastState = assistantState;
+    } else {
+      // Continuously advance the GIF animation
+      tickAssistantGif();
+    }
+
+    // Keep the text overlay fresh when transcription/response updates arrive.
+    // Only re-draw the text band — never overwrite the GIF area.
+    static String lastTranscription;
+    static String lastResponse;
+    if (currentTranscription != lastTranscription || currentResponse != lastResponse) {
+      drawAssistantTextOverlay();
+      lastTranscription = currentTranscription;
+      lastResponse = currentResponse;
+    }
   }
 }
 
@@ -426,144 +532,106 @@ String formatNumber(int num) {
 }
 
 // === ASSISTANT SCREEN ===
-void drawAssistantScreen() {
-  tft.fillScreen(TFT_BLACK);
-  
-  // Screen indicator
+
+// Draw the static text layer (indicator + hint/transcription/response).
+// Called once when the state changes; the GIF tick redraws the orb each frame
+// but does NOT touch the text rows at the bottom.
+void drawAssistantTextOverlay() {
+  // Screen indicator (top ~30px)
   drawScreenIndicator();
-  
-  int centerX = 233;
-  int centerY = 233;
-  
+
+  // Clear the text band at the bottom (y 350-466)
+  tft.fillRect(0, 350, 466, 116, TFT_BLACK);
+
   switch (assistantState) {
     case IDLE:
-      drawIdleState(centerX, centerY);
+      tft.setTextColor(TFT_DARKGREY);
+      tft.setTextSize(2);
+      tft.setCursor(145, 430);
+      tft.print("Tap to speak");
       break;
+
     case LISTENING:
-      drawListeningState(centerX, centerY);
+      tft.setTextColor(TFT_DARKGREY);
+      tft.setTextSize(2);
+      tft.setCursor(133, 356);
+      tft.print("Tap to cancel");
+      if (currentTranscription.length() > 0) {
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        drawWrappedText(currentTranscription, 30, 384, 406);
+      }
       break;
+
     case THINKING:
-      drawThinkingState(centerX, centerY);
+      tft.setTextColor(TFT_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(155, 356);
+      tft.print("Thinking...");
       break;
+
     case SPEAKING:
-      drawSpeakingState(centerX, centerY);
+      if (currentResponse.length() > 0) {
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        drawWrappedText(currentResponse, 30, 356, 406);
+      }
       break;
   }
-  
-  // Show instruction at bottom
-  if (assistantState == IDLE) {
-    tft.setTextColor(TFT_DARKGREY);
-    tft.setTextSize(2);
-    tft.setCursor(120, 420);
-    tft.print("Tap to speak");
-  } else if (assistantState == LISTENING) {
-    tft.setTextColor(TFT_DARKGREY);
-    tft.setTextSize(2);
-    tft.setCursor(120, 420);
-    tft.print("Tap to cancel");
-  }
 }
 
-void drawIdleState(int cx, int cy) {
-  // Draw large circle icon
-  tft.drawCircle(cx, cy - 50, 80, TFT_BLUE);
-  tft.drawCircle(cx, cy - 50, 81, TFT_BLUE);
-  tft.drawCircle(cx, cy - 50, 82, TFT_BLUE);
-  
-  // Draw microphone icon inside
-  drawMicrophoneIcon(cx, cy - 50, TFT_BLUE);
-  
-  // Status text
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(3);
-  tft.setCursor(180, cy + 70);
-  tft.print("Ready");
-}
-
-void drawListeningState(int cx, int cy) {
-  // Animated waveform circle
-  static int waveOffset = 0;
-  waveOffset = (waveOffset + 5) % 360;
-  
-  for (int i = 0; i < 360; i += 10) {
-    int radius = 80 + sin((i + waveOffset) * PI / 180.0) * 15;
-    float angle = i * PI / 180.0;
-    int x1 = cx + cos(angle) * radius;
-    int y1 = (cy - 50) + sin(angle) * radius;
-    tft.drawPixel(x1, y1, TFT_GREEN);
-  }
-  
-  // Microphone icon
-  drawMicrophoneIcon(cx, cy - 50, TFT_GREEN);
-  
-  // Status text
-  tft.setTextColor(TFT_GREEN);
-  tft.setTextSize(3);
-  tft.setCursor(150, cy + 70);
-  tft.print("Listening...");
-  
-  // Show transcription if available
-  if (currentTranscription.length() > 0) {
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(2);
-    drawWrappedText(currentTranscription, 40, cy + 120, 386);
-  }
-}
-
-void drawThinkingState(int cx, int cy) {
-  // Spinning dots animation
-  static int spinAngle = 0;
-  spinAngle = (spinAngle + 10) % 360;
-  
-  for (int i = 0; i < 3; i++) {
-    float angle = (spinAngle + i * 120) * PI / 180.0;
-    int x = cx + cos(angle) * 60;
-    int y = (cy - 50) + sin(angle) * 60;
-    tft.fillCircle(x, y, 8, TFT_YELLOW);
-  }
-  
-  // Status text
-  tft.setTextColor(TFT_YELLOW);
-  tft.setTextSize(3);
-  tft.setCursor(150, cy + 70);
-  tft.print("Thinking...");
-}
-
-void drawSpeakingState(int cx, int cy) {
-  // Pulsing circle
-  static int pulseRadius = 70;
-  static int pulseDirection = 1;
-  pulseRadius += pulseDirection * 3;
-  if (pulseRadius > 90 || pulseRadius < 70) {
-    pulseDirection *= -1;
-  }
-  
-  tft.drawCircle(cx, cy - 50, pulseRadius, TFT_MAGENTA);
-  tft.drawCircle(cx, cy - 50, pulseRadius + 1, TFT_MAGENTA);
-  
-  // Speaker icon
-  drawSpeakerIcon(cx, cy - 50, TFT_MAGENTA);
-  
-  // Status text
-  tft.setTextColor(TFT_MAGENTA);
-  tft.setTextSize(3);
-  tft.setCursor(150, cy + 70);
-  tft.print("Speaking...");
-  
-  // Show response text
-  if (currentResponse.length() > 0) {
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(2);
-    drawWrappedText(currentResponse, 40, cy + 120, 386);
-  }
+// Full redraw — used when first entering the assistant screen or changing state.
+void drawAssistantScreen() {
+  tft.fillScreen(TFT_BLACK);
+  openGifForState(assistantState);   // opens (or re-opens) the right GIF
+  gif.playFrame(false, nullptr);     // render the first frame immediately
+  drawAssistantTextOverlay();
 }
 
 // === CLOCK SCREEN ===
+
+// Colors matching the Figma design (node 1-53, 466px frame)
+#define CLOCK_FACE_COLOR  tft.color565(208, 208, 212)  // light gray
+#define CLOCK_HAND_COLOR  tft.color565(  0,   9, 170)  // #0009AA deep blue
+#define CLOCK_DOT_COLOR   tft.color565(220,  40,  40)  // red minute dot
+
+// Blend two RGB565 colours linearly.  t=0 → c1,  t=1 → c2.
+static uint16_t blendColor565(uint16_t c1, uint16_t c2, float t) {
+  int r1 = (c1 >> 11) & 0x1F,  r2 = (c2 >> 11) & 0x1F;
+  int g1 = (c1 >>  5) & 0x3F,  g2 = (c2 >>  5) & 0x3F;
+  int b1 =  c1        & 0x1F,  b2 =  c2        & 0x1F;
+  return (uint16_t)((int)(r1 + (r2 - r1) * t) << 11) |
+         (uint16_t)((int)(g1 + (g2 - g1) * t) <<  5) |
+         (uint16_t) (int)(b1 + (b2 - b1) * t);
+}
+
+// Draw a clock hand as a blurred pill.
+// TFT_eSPI has no native blur, so we layer four drawWideLine passes:
+// three progressively wider rings fading toward the face colour (soft glow),
+// then the solid core — producing the same frosted look as canvas blur(6px).
+void drawClockHand(int cx, int cy, float angleDeg,
+                   float offset, float len, float W, uint16_t color) {
+  float rad  = angleDeg * PI / 180.0f;
+  float sinA = sin(rad),  cosA = cos(rad);
+  float half = len / 2.0f;
+
+  float x0 = cx + sinA * (offset + half);   // tip end
+  float y0 = cy - cosA * (offset + half);
+  float x1 = cx + sinA * (offset - half);   // back end
+  float y1 = cy - cosA * (offset - half);
+
+  uint16_t bg = CLOCK_FACE_COLOR;
+  // Outer glow → inner core  (bg-blend fraction decreases inward)
+  tft.drawWideLine(x0, y0, x1, y1, W + 18, blendColor565(color, bg, 0.82f), bg);
+  tft.drawWideLine(x0, y0, x1, y1, W + 10, blendColor565(color, bg, 0.58f), bg);
+  tft.drawWideLine(x0, y0, x1, y1, W +  4, blendColor565(color, bg, 0.28f), bg);
+  tft.drawWideLine(x0, y0, x1, y1, W,      color, bg);
+}
+
 void drawClockScreen() {
   tft.fillScreen(TFT_BLACK);
   drawScreenIndicator();
-  
-  // Get current time
+
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     tft.setTextColor(TFT_RED);
@@ -572,38 +640,32 @@ void drawClockScreen() {
     tft.print("Time sync failed");
     return;
   }
-  
-  // Draw time - large
-  char timeStr[10];
-  strftime(timeStr, sizeof(timeStr), "%I:%M", &timeinfo);
-  
-  // Remove leading zero from hour
-  String timeString = String(timeStr);
-  if (timeString.startsWith("0")) {
-    timeString = timeString.substring(1);
-  }
-  
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(8);
-  int textWidth = timeString.length() * 48;
-  tft.setCursor((466 - textWidth) / 2, 160);
-  tft.print(timeString);
-  
-  // AM/PM
-  char ampm[3];
-  strftime(ampm, sizeof(ampm), "%p", &timeinfo);
-  tft.setTextSize(3);
-  tft.setCursor(200, 250);
-  tft.print(ampm);
-  
-  // Draw date
-  char dateStr[30];
-  strftime(dateStr, sizeof(dateStr), "%A, %B %d", &timeinfo);
-  
-  tft.setTextSize(2);
-  textWidth = strlen(dateStr) * 12;
-  tft.setCursor((466 - textWidth) / 2, 300);
-  tft.print(dateStr);
+
+  int hour   = timeinfo.tm_hour % 12;
+  int minute = timeinfo.tm_min;
+
+  const int cx = 233, cy = 233, faceRadius = 233;
+
+  // ── Clock face ───────────────────────────────────────────────────────────
+  tft.fillCircle(cx, cy, faceRadius, CLOCK_FACE_COLOR);
+
+  // ── Hands — blurred via glow layers (frosted-glass approximation) ─────────
+  // Each hand is drawn as four concentric passes: wide faint rings outward
+  // fading toward the face colour, then the solid core inward.
+  // The outermost ring also serves as the frosted-overlay: its very light
+  // tint lightens the face around each hand, giving the same washed-out look
+  // as the rgba(255,255,255,0.35) overlay used in the HTML preview.
+  float minuteAngle = minute * 6.0f;
+  drawClockHand(cx, cy, minuteAngle, 95.0f, 190.0f, 35.0f, CLOCK_HAND_COLOR);
+
+  float hourAngle = hour * 30.0f + minute * 0.5f;
+  drawClockHand(cx, cy, hourAngle, 116.0f, 88.0f, 35.0f, CLOCK_HAND_COLOR);
+
+  // ── Red dot — sharp, drawn last so it sits above the blurred hands ────────
+  float dotRad = minuteAngle * PI / 180.0f;
+  int dotX = cx + (int)(sin(dotRad) * 153.0f);
+  int dotY = cy - (int)(cos(dotRad) * 153.0f);
+  tft.fillCircle(dotX, dotY, 38, CLOCK_DOT_COLOR);
 }
 
 // === CALENDAR SCREEN ===
@@ -712,65 +774,62 @@ void drawSpeakerIcon(int cx, int cy, uint16_t color) {
 }
 
 // === LIGHTS SCREEN ===
+
+// Bulb icon — globe dome + tapered body + 3-bar socket.
+// cx/cy = icon centre.  Matches Figma node 1-91 / 1-94 (≈47×82 px).
+void drawBulbIcon(int cx, int cy, bool isOn) {
+  uint16_t color = isOn
+    ? tft.color565(255, 208,   0)   // bright yellow — ON
+    : tft.color565(200, 160,  40);  // dim amber     — OFF
+
+  // Globe dome
+  tft.fillCircle(cx, cy - 14, 23, color);
+
+  // Body below dome (filled rect + rounded bottom to merge with dome)
+  tft.fillRect(cx - 14, cy - 5, 28, 26, color);
+  tft.fillCircle(cx, cy + 20, 14, color);
+
+  // Base/socket — 3 narrowing bars
+  tft.fillRect(cx - 13, cy + 28, 26, 5, color);
+  tft.fillRect(cx - 11, cy + 34, 22, 5, color);
+  tft.fillRect(cx -  9, cy + 40, 18, 5, color);
+}
+
 void drawLightsScreen() {
+  // ── Colours (Figma node 1-73) ──────────────────────────────────────────
+  const uint16_t leftBg    = tft.color565( 20,  20,  20);  // #141414 near-black
+  const uint16_t rightBg   = tft.color565( 38,  38,  38);  // #262626 medium dark
+  const uint16_t leftCard  = tft.color565( 34,  34,  34);  // #222222
+  const uint16_t rightCard = tft.color565( 54,  54,  54);  // #363636
+
+  const int cx = 233, cy = 233, r = 233;
+
   tft.fillScreen(TFT_BLACK);
+
+  // ── Left half: fill whole circle with left bg ──────────────────────────
+  tft.fillCircle(cx, cy, r, leftBg);
+
+  // ── Right half: scanline fill within the circle (x > cx+1) ────────────
+  for (int scanY = -r; scanY <= r; scanY++) {
+    int hw = (int)sqrtf((float)(r * r - scanY * scanY));
+    int x0 = cx + 2;          // 2 px divider gap
+    int x1 = cx + hw;
+    if (x1 > x0)
+      tft.drawFastHLine(x0, cy + scanY, x1 - x0, rightBg);
+  }
+
+  // ── Cards — lower half of each panel, rounded top corners ─────────────
+  // Left card: x=17, y=233, w=209, h fills to circle bottom
+  tft.fillRoundRect(17,  cy, 209, r, 20, leftCard);
+  // Right card: x=240, mirrored
+  tft.fillRoundRect(240, cy, 209, r, 20, rightCard);
+
+  // ── Screen indicator (lights dot goes active automatically) ───────────
   drawScreenIndicator();
 
-  // Title
-  tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(170, 38);
-  tft.print("Lights");
-
-  const int MARGIN  = 20;
-  const int GAP     = 14;
-  const int TOP_OFF = 58;
-  const int CARD_W  = (466 - MARGIN * 2 - GAP) / 2;       // 206
-  const int CARD_H  = (466 - TOP_OFF - MARGIN - GAP) / 2; // 187
-
-  for (int i = 0; i < 4; i++) {
-    int col = i % 2;
-    int row = i / 2;
-    int x   = MARGIN + col * (CARD_W + GAP);
-    int y   = TOP_OFF + row * (CARD_H + GAP);
-
-    // Card background: warm amber when on, dark grey when off
-    uint16_t cardBg = lights[i].on ? tft.color565(60, 50, 5) : tft.color565(30, 30, 30);
-    tft.fillRoundRect(x, y, CARD_W, CARD_H, 16, cardBg);
-
-    // Bulb icon
-    int bulbCX = x + CARD_W / 2;
-    int bulbCY = y + CARD_H / 2 - 20;
-    uint16_t iconColor = lights[i].on ? TFT_YELLOW : tft.color565(70, 70, 70);
-    tft.fillCircle(bulbCX, bulbCY, 30, iconColor);
-    tft.fillRect(bulbCX - 8, bulbCY + 30, 16, 10, iconColor);
-    tft.fillRect(bulbCX - 6, bulbCY + 40, 12, 6, iconColor);
-
-    // Light name
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(2);
-    int nameLen = strlen(lights[i].name);
-    tft.setCursor(x + (CARD_W - nameLen * 12) / 2, y + CARD_H - 50);
-    tft.print(lights[i].name);
-
-    // On/Off label + brightness
-    if (lights[i].on) {
-      tft.setTextColor(TFT_YELLOW);
-      tft.setTextSize(2);
-      tft.setCursor(x + (CARD_W - 24) / 2, y + CARD_H - 32);
-      tft.print("ON");
-      tft.setTextSize(1);
-      tft.setTextColor(TFT_LIGHTGREY);
-      String bStr = String(lights[i].brightness) + "%";
-      tft.setCursor(x + (CARD_W - (int)bStr.length() * 6) / 2, y + CARD_H - 16);
-      tft.print(bStr);
-    } else {
-      tft.setTextColor(tft.color565(100, 100, 100));
-      tft.setTextSize(2);
-      tft.setCursor(x + (CARD_W - 36) / 2, y + CARD_H - 32);
-      tft.print("OFF");
-    }
-  }
+  // ── Bulb icons — Figma centres: left=(158,369) right=(307,369) ─────────
+  drawBulbIcon(158, 369, lights[0].on);
+  drawBulbIcon(307, 369, lights[1].on);
 }
 
 void toggleLight(int idx) {

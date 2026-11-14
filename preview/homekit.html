@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bento — Homekit Preview</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a1a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: system-ui, sans-serif;
+      gap: 16px;
+    }
+    .label {
+      color: #555;
+      font-size: 12px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    canvas {
+      border-radius: 50%;
+      box-shadow: 0 0 60px rgba(0,0,0,0.8);
+      image-rendering: pixelated;
+    }
+    nav {
+      color: #444;
+      font-size: 11px;
+    }
+    nav a { color: #666; text-decoration: none; }
+    nav a:hover { color: #aaa; }
+  </style>
+</head>
+<body>
+  <nav><a href="index.html">← Clock</a></nav>
+  <div class="label">Homekit Screen — 466 × 466</div>
+  <canvas id="c" width="466" height="466"></canvas>
+
+  <script>
+    const canvas = document.getElementById('c');
+    const ctx    = canvas.getContext('2d');
+
+    // ── Colours (from Figma node 1-73) ─────────────────────────────────────
+    const CX = 233, CY = 233, R = 233;
+
+    // Panel / card fills
+    const LEFT_BG   = '#141414';   // left half  — OFF state, near black
+    const LEFT_CARD = '#222222';   // left card  — slightly lighter
+    const RIGHT_BG  = '#262626';   // right half — ON state, medium dark
+    const RIGHT_CARD= '#363636';   // right card — lighter
+
+    // Divider: thin ~3px line at centre
+    const GAP_L = 231;   // left edge of divider
+    const GAP_R = 235;   // right edge of divider
+
+    // Card geometry (from Figma boolean ops)
+    const CARD_Y = 233;            // cards start at vertical centre
+    const CARD_R = 20;             // top corner radius
+
+    // Bulb colours
+    const BULB_OFF = '#C8A028';    // dim amber  (left / off)
+    const BULB_ON  = '#FFD000';    // bright yellow (right / on)
+
+    // Screen indicator
+    const IND_ACTIVE = '#ffffff';
+    const IND_IDLE   = 'rgba(255,255,255,0.22)';
+
+    // ── Bulb icon ───────────────────────────────────────────────────────────
+    // cx/cy = icon centre, s = scale (1 → ~47×82 native Figma size)
+    function drawBulb(cx, cy, s, isOn) {
+      const color = isOn ? BULB_ON : BULB_OFF;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.fillStyle = color;
+
+      // Wide globe dome + tapered neck — single filled path
+      // Dome centre sits at y = -14*s; dome radius ≈ 23*s
+      // Sides curve inward toward a narrow neck, then flare to a flat base
+      ctx.beginPath();
+      ctx.arc(0, -14 * s, 23 * s, Math.PI, 0);       // top dome (half-circle)
+      // Right side: curve inward to neck then outward to base
+      ctx.bezierCurveTo( 23*s, 2*s,  16*s, 14*s, 14*s, 22*s);
+      ctx.lineTo( 14*s, 26*s);
+      ctx.lineTo(-14*s, 26*s);
+      ctx.lineTo(-14*s, 22*s);
+      // Left side back up
+      ctx.bezierCurveTo(-16*s, 14*s, -23*s, 2*s, -23*s, -14*s);
+      ctx.closePath();
+      ctx.fill();
+
+      // Base / socket — 3 narrowing bars
+      const barY = 28 * s;
+      const bars = [
+        { w: 26*s, h: 5*s },
+        { w: 22*s, h: 5*s },
+        { w: 17*s, h: 5*s },
+      ];
+      bars.forEach(({ w, h }, i) => {
+        ctx.fillStyle = color;
+        ctx.fillRect(-w / 2, barY + i * 6*s, w, h);
+      });
+
+      ctx.restore();
+    }
+
+    // ── Screen indicator ────────────────────────────────────────────────────
+    // active: 0=calendar 1=assistant 2=clock  3=youtube 4=lights
+    function drawScreenIndicator(active) {
+      const dotCY = 42, hSp = 25, vSp = 22;
+      ctx.lineWidth = 1.5;
+
+      // Horizontal trio
+      for (let i = 0; i < 3; i++) {
+        const x = CX - hSp + i * hSp;
+        ctx.beginPath();
+        ctx.arc(x, dotCY, 5, 0, Math.PI * 2);
+        if (i === active) { ctx.fillStyle = IND_ACTIVE; ctx.fill(); }
+        else              { ctx.strokeStyle = IND_IDLE;  ctx.stroke(); }
+      }
+
+      // YouTube (above)
+      ctx.beginPath();
+      ctx.arc(CX, dotCY - vSp, 5, 0, Math.PI * 2);
+      if (active === 3) { ctx.fillStyle = IND_ACTIVE; ctx.fill(); }
+      else              { ctx.strokeStyle = IND_IDLE;  ctx.stroke(); }
+
+      // Lights (below) — active on this screen
+      ctx.beginPath();
+      ctx.arc(CX, dotCY + vSp, 5, 0, Math.PI * 2);
+      if (active === 4) { ctx.fillStyle = IND_ACTIVE; ctx.fill(); }
+      else              { ctx.strokeStyle = IND_IDLE;  ctx.stroke(); }
+    }
+
+    // ── Main draw ───────────────────────────────────────────────────────────
+    function draw() {
+      // Background
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, 466, 466);
+
+      // Clip all fills to the circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(CX, CY, R, 0, Math.PI * 2);
+      ctx.clip();
+
+      // ── Left half background ─────────────────────────────────────────────
+      ctx.fillStyle = LEFT_BG;
+      ctx.fillRect(0, 0, GAP_L, 466);
+
+      // ── Right half background ────────────────────────────────────────────
+      ctx.fillStyle = RIGHT_BG;
+      ctx.fillRect(GAP_R, 0, 466 - GAP_R, 466);
+
+      // ── Left card (lower half, rounded top corners) ──────────────────────
+      ctx.fillStyle = LEFT_CARD;
+      ctx.beginPath();
+      // Figma: x=16.88, y=233, w=209.36, h=215.79
+      ctx.roundRect(17, CARD_Y, 209, 216, [CARD_R, CARD_R, 0, 0]);
+      ctx.fill();
+
+      // ── Right card ───────────────────────────────────────────────────────
+      ctx.fillStyle = RIGHT_CARD;
+      ctx.beginPath();
+      // Mirror of left card: x=240, y=233, w=209, h=216
+      ctx.roundRect(240, CARD_Y, 209, 216, [CARD_R, CARD_R, 0, 0]);
+      ctx.fill();
+
+      ctx.restore();   // end circle clip
+
+      // ── Screen indicator — Lights active (4) ────────────────────────────
+      drawScreenIndicator(4);
+
+      // ── Bulb icons (Figma centres: left=(158,369) right=(307,369)) ───────
+      // Scale 1.0 → 47×82 native; we use 1.0 for pixel-accurate size
+      drawBulb(158, 369, 1.0, false);   // left — OFF
+      drawBulb(307, 369, 1.0, true);    // right — ON
+    }
+
+    draw();
+  </script>
+</body>
+</html>

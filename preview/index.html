@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bento Preview</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a1a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: system-ui, sans-serif;
+      gap: 16px;
+    }
+    .label {
+      color: #555;
+      font-size: 12px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    canvas {
+      border-radius: 50%;
+      box-shadow: 0 0 60px rgba(0,0,0,0.8);
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <nav style="color:#444;font-size:11px"><a href="homekit.html" style="color:#666;text-decoration:none">Homekit →</a></nav>
+  <div class="label">Clock Screen — 466 × 466</div>
+  <canvas id="c" width="466" height="466"></canvas>
+
+  <script>
+    const canvas = document.getElementById('c');
+    const ctx    = canvas.getContext('2d');
+
+    // ── Colours ────────────────────────────────────────────────────────────
+    const BG          = '#000000';
+    const FACE_COLOR  = 'rgb(208, 208, 212)';
+    const HAND_COLOR  = '#0009AA';
+    const DOT_COLOR   = 'rgb(220, 40, 40)';
+    const IND_ACTIVE  = '#ffffff';
+    const IND_IDLE    = 'rgba(255,255,255,0.25)';
+
+    // ── Layout ─────────────────────────────────────────────────────────────
+    const CX          = 233;   // true canvas centre
+    const CY          = 233;
+    const FACE_RADIUS = 233;   // fills entire 466×466 circle
+
+    // ── Hand geometry (reverse-engineered from Figma node 1-53 bboxes) ────
+    // Each hand is a filled pill. We store:
+    //   W      — hand width (pill diameter at ends)
+    //   LEN    — total pill length
+    //   OFFSET — distance from clock pivot to pill's geometric centre,
+    //             measured along the forward (tip) direction.
+    //             Both hands float entirely forward of the pivot.
+
+    // Minute hand — thin, long, back end anchored at the pivot
+    //   offset = len/2  →  back end sits exactly at (CX, CY)
+    const MIN_W      = 35;
+    const MIN_LEN    = 190;
+    const MIN_OFFSET = 95;   // = MIN_LEN / 2
+
+    // Hour hand — same width, ~half the minute length,
+    //   centre floats at FACE_RADIUS/2 ≈ 116px from pivot
+    const HOUR_W      = 35;
+    const HOUR_LEN    = 88;
+    const HOUR_OFFSET = 116;  // ≈ FACE_RADIUS / 2
+
+    // Red minute dot: radius 75, orbits near the face edge
+    const DOT_R      = 37.5;  // diameter 75 → radius 37.5
+    const DOT_ORBIT  = 153;   // 233 (face radius) − 80px from edge
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    // Draw a filled pill rotated angleDeg CW from 12-o'clock.
+    //   offset — distance from clock pivot to pill centre (forward = tip direction)
+    //   len    — total pill length
+    //   W      — pill width (corner radius = W/2 → full semicircle ends)
+    function drawHand(cx, cy, angleDeg, offset, len, W, color) {
+      const r   = W / 2;
+      const rad = angleDeg * Math.PI / 180;
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(rad);
+      // In rotated space, -y is the tip direction (12 o'clock = up).
+      // Pill centre is `offset` pixels ahead of pivot → at y = -offset.
+      ctx.beginPath();
+      ctx.roundRect(-W / 2, -(offset + len / 2), W, len, r);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawScreenIndicator(activeScreen) {
+      // cross layout: 3 dots in a horizontal row (calendar, assistant, clock)
+      // plus YouTube above centre and Lights below centre
+      const dotCY = 42;          // y of the horizontal row — inside the face
+      const hSp   = 25;
+      const vSp   = 22;
+
+      ctx.lineWidth = 1.5;
+
+      // Horizontal row: calendar(0), assistant(1), clock(2)
+      for (let i = 0; i < 3; i++) {
+        const x = CX - hSp + i * hSp;
+        ctx.beginPath();
+        ctx.arc(x, dotCY, 5, 0, Math.PI * 2);
+        if (i === activeScreen) {
+          ctx.fillStyle = IND_ACTIVE;
+          ctx.fill();
+        } else {
+          ctx.strokeStyle = IND_IDLE;
+          ctx.stroke();
+        }
+      }
+
+      // YouTube dot (above row)
+      ctx.beginPath();
+      ctx.arc(CX, dotCY - vSp, 5, 0, Math.PI * 2);
+      ctx.strokeStyle = IND_IDLE;
+      ctx.stroke();
+
+      // Lights dot (below row)
+      ctx.beginPath();
+      ctx.arc(CX, dotCY + vSp, 5, 0, Math.PI * 2);
+      ctx.strokeStyle = IND_IDLE;
+      ctx.stroke();
+    }
+
+    function draw() {
+      const now    = new Date();
+      const hour   = now.getHours() % 12;
+      const minute = now.getMinutes();
+      const second = now.getSeconds();
+
+      // ── Background ───────────────────────────────────────────────────────
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, 466, 466);
+
+      // ── Clock face (fills entire canvas circle) ──────────────────────────
+      ctx.beginPath();
+      ctx.arc(CX, CY, FACE_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle = FACE_COLOR;
+      ctx.fill();
+
+      // ── Screen indicator (clock = index 2) ───────────────────────────────
+      drawScreenIndicator(2);
+
+      // ── Hands — drawn with blur so they read as behind frosted glass ─────
+      const minuteAngle = minute * 6 + second * 0.1;   // smooth sweep
+      const hourAngle   = hour * 30 + minute * 0.5;
+      ctx.save();
+      ctx.filter = 'blur(6px)';
+      drawHand(CX, CY, minuteAngle, MIN_OFFSET, MIN_LEN, MIN_W, HAND_COLOR);
+      drawHand(CX, CY, hourAngle,   HOUR_OFFSET, HOUR_LEN, HOUR_W, HAND_COLOR);
+      ctx.restore();   // resets filter
+
+      // ── Frosted glass overlay — sits over the hands, under the dot ────────
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(CX, CY, FACE_RADIUS, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx.fillRect(0, 0, 466, 466);
+      ctx.restore();
+
+      // ── Red dot — sharp, above the frost ──────────────────────────────────
+      const dotRad = minuteAngle * Math.PI / 180;
+      const dotX   = CX + Math.sin(dotRad) * DOT_ORBIT;
+      const dotY   = CY - Math.cos(dotRad) * DOT_ORBIT;
+      ctx.beginPath();
+      ctx.arc(dotX, dotY, DOT_R, 0, Math.PI * 2);
+      ctx.fillStyle = DOT_COLOR;
+      ctx.fill();
+    }
+
+    // Draw immediately then tick every second
+    draw();
+    setInterval(draw, 1000);
+  </script>
+</body>
+</html>
